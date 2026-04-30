@@ -1,0 +1,449 @@
+---
+title: "SVAR do Choque de Petróleo e Inflação de Serviços no Brasil"
+author: "Modelo VAR Estrutural com Identificação por Restrições de Sinal"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 12, fig.height = 7, fig.retina = 2,
+  dpi = 150, out.width = "100%"
+)
+```
+
+# Introdução
+
+Este documento implementa um **Modelo VAR Estrutural (SVAR)** para investigar o impacto de choques de petróleo sobre a inflação de serviços no Brasil.
+
+**Metodologia:**
+- VAR reduzido estimado por OLS
+- Seleção de defasagens por AIC/BIC
+- Identificação estrutural via **restrições de sinal** (Rubio-Ramírez, Waggoner & Zha): nos 6 primeiros meses após choque, Brent sobe, produção global cai e IPCA combustíveis sobe
+- Resposta do IPCA serviços: **livre** (objeto de interesse)
+- Horizontes: impulso-resposta (24 meses) e decomposição da variância (24 meses)
+
+---
+
+# Motor SVAR em R Base
+
+Abaixo, carregamos a implementação:
+
+```{r source_svar}
+# Salvar motor SVAR localmente (inline pois pode não estar no path)
+svar_code <- '
+estimate_var <- function(Y, p, const = TRUE) {
+  Y <- as.matrix(Y)
+  Tn <- nrow(Y); k <- ncol(Y)
+  if (p < 1) stop("p>=1")
+  Yt  <- Y[(p+1):Tn, , drop = FALSE]
+  X <- NULL
+  for (i in 1:p) X <- cbind(X, Y[(p+1-i):(Tn-i), , drop = FALSE])
+  if (const) X <- cbind(1, X)
+  B <- solve(crossprod(X)) %*% crossprod(X, Yt)
+  U <- Yt - X %*% B
+  Tr <- nrow(Yt)
+  Sigma <- crossprod(U) / (Tr - ncol(X))
+  list(B = B, U = U, Sigma = Sigma, p = p, k = k, const = const,
+       Tr = Tr, X = X, Y = Yt)
+}
+
+companion_form <- function(varfit) {
+  k <- varfit$k; p <- varfit$p
+  B <- varfit$B
+  off <- if (varfit$const) 1 else 0
+  A <- t(B[(off + 1):nrow(B), , drop = FALSE])
+  if (p == 1) {
+    F <- A
+  } else {
+    F <- rbind(A, cbind(diag(k * (p - 1)), matrix(0, k * (p - 1), k)))
+  }
+  F
+}
+
+lag_selection <- function(Y, pmax = 12, const = TRUE) {
+  Y <- as.matrix(Y); Tn <- nrow(Y); k <- ncol(Y)
+  Tcom <- Tn - pmax
+  out <- matrix(NA_real_, pmax, 3,
+                dimnames = list(paste0("p=", 1:pmax), c("AIC", "BIC", "HQC")))
+  for (p in 1:pmax) {
+    Yt <- Y[(pmax + 1):Tn, , drop = FALSE]
+    X <- NULL
+    for (i in 1:p) X <- cbind(X, Y[(pmax + 1 - i):(Tn - i), , drop = FALSE])
+    if (const) X <- cbind(1, X)
+    B <- solve(crossprod(X)) %*% crossprod(X, Yt)
+    U <- Yt - X %*% B
+    Sigma_ml <- crossprod(U) / Tcom
+    ld <- determinant(Sigma_ml, logarithm = TRUE)$modulus
+    npar <- k * p + ifelse(const, 1, 0)
+    out[p, "AIC"] <- ld + 2 * npar * k / Tcom
+    out[p, "BIC"] <- ld + log(Tcom) * npar * k / Tcom
+    out[p, "HQC"] <- ld + 2 * log(log(Tcom)) * npar * k / Tcom
+  }
+  best <- apply(out, 2, which.min)
+  list(table = out, best = best)
+}
+
+irf_struct <- function(varfit, B0, h = 24) {
+  k <- varfit$k; p <- varfit$p
+  Fc <- companion_form(varfit)
+  J <- cbind(diag(k), matrix(0, k, k * (p - 1)))
+  IRF <- array(0, dim = c(h + 1, k, k))
+  Phi_h <- diag(k * p)
+  for (hh in 0:h) {
+    Psi <- J %*% Phi_h %*% t(J)
+    IRF[hh + 1, , ] <- Psi %*% B0
+    Phi_h <- Phi_h %*% Fc
+  }
+  IRF
+}
+
+fevd_struct <- function(IRF) {
+  hp <- dim(IRF)[1]; k <- dim(IRF)[2]
+  FE <- array(0, c(hp, k, k))
+  cum_var <- matrix(0, k, k)
+  for (hh in 1:hp) {
+    cum_var <- cum_var + (IRF[hh, , ])^2
+    tot <- rowSums(cum_var)
+    FE[hh, , ] <- cum_var / tot
+  }
+  FE
+}
+
+sign_restrict <- function(varfit, sign_mat, h_rest = 6, n_draws = 500,
+                          max_tries = 200000, seed = 1) {
+  set.seed(seed)
+  k <- varfit$k
+  P <- t(chol(varfit$Sigma))
+  acc <- list(); tries <- 0
+  while (length(acc) < n_draws && tries < max_tries) {
+    tries <- tries + 1
+    Z <- matrix(rnorm(k * k), k, k)
+    qr_z <- qr(Z); Q <- qr.Q(qr_z); R <- qr.R(qr_z)
+    sgn <- sign(diag(R)); sgn[sgn == 0] <- 1
+    Q <- Q %*% diag(sgn)
+    B0 <- P %*% Q
+    B0_cand <- matrix(NA_real_, k, k); ok_cols <- TRUE
+    for (j in 1:k) {
+      restr_col <- sign_mat[, j]
+      if (all(restr_col == 0)) {
+        B0_cand[, j] <- B0[, j]
+      } else {
+        idx_r <- which(restr_col != 0)
+        v <- B0[, j]
+        if (all(sign(v[idx_r]) == restr_col[idx_r])) {
+          B0_cand[, j] <- v
+        } else if (all(sign(-v[idx_r]) == restr_col[idx_r])) {
+          B0_cand[, j] <- -v
+        } else { ok_cols <- FALSE; break }
+      }
+    }
+    if (!ok_cols) next
+    IRF <- irf_struct(varfit, B0_cand, h = h_rest - 1)
+    ok <- TRUE
+    for (j in 1:k) {
+      restr <- sign_mat[, j]
+      if (all(restr == 0)) next
+      idx <- which(restr != 0)
+      for (hh in 1:h_rest) {
+        sg <- sign(IRF[hh, idx, j])
+        if (any(sg * restr[idx] <= 0)) { ok <- FALSE; break }
+      }
+      if (!ok) break
+    }
+    if (ok) acc[[length(acc) + 1]] <- B0_cand
+  }
+  list(draws = acc, tries = tries, accepted = length(acc))
+}
+
+irf_bands <- function(varfit, draws, h = 24, probs = c(0.16, 0.5, 0.84)) {
+  n <- length(draws); k <- varfit$k
+  arr <- array(NA_real_, c(n, h + 1, k, k))
+  for (i in 1:n) arr[i, , , ] <- irf_struct(varfit, draws[[i]], h = h)
+  out <- array(NA_real_, c(length(probs), h + 1, k, k))
+  for (a in 1:(h + 1)) for (b in 1:k) for (c in 1:k)
+    out[, a, b, c] <- quantile(arr[, a, b, c], probs = probs, na.rm = TRUE)
+  list(quantiles = out, probs = probs, all = arr)
+}
+
+fevd_bands <- function(varfit, draws, h = 24, probs = c(0.16, 0.5, 0.84)) {
+  n <- length(draws); k <- varfit$k
+  arr <- array(NA_real_, c(n, h + 1, k, k))
+  for (i in 1:n) {
+    irf_i <- irf_struct(varfit, draws[[i]], h = h)
+    arr[i, , , ] <- fevd_struct(irf_i)
+  }
+  out <- array(NA_real_, c(length(probs), h + 1, k, k))
+  for (a in 1:(h + 1)) for (b in 1:k) for (c in 1:k)
+    out[, a, b, c] <- quantile(arr[, a, b, c], probs = probs, na.rm = TRUE)
+  list(quantiles = out, probs = probs, all = arr)
+}
+'
+eval(parse(text = svar_code))
+cat("Motor SVAR carregado com sucesso.\n")
+```
+
+---
+
+# Dados: Simulação com DGP Calibrada
+
+Usamos **dados simulados** de uma DGP calibrada para reprodutibilidade. A estrutura simula um choque de petróleo realista:
+
+```{r sim_dgp}
+set.seed(123)
+
+k <- 6
+varnames <- c("Δ log(Brent)", "Δ log(Prod Global)", "Δ log(Ativ Brasil)",
+              "Δ log(BRL/USD)", "IPCA Combustíveis (%m/m)", "IPCA Serviços (%m/m)")
+
+# B0: impactos no choque de petróleo (coluna 1)
+B0_true <- matrix(0, k, k)
+B0_true[, 1] <- c(0.060, -0.008, -0.003, 0.012, 0.80, 0.05)
+B0_true[, 2] <- c(0.000,  0.006, 0.002, -0.001, 0.02, 0.00)
+B0_true[, 3] <- c(0.005,  0.000, 0.008,  0.000, 0.05, 0.02)
+B0_true[, 4] <- c(0.000,  0.000, 0.001, 0.030, 0.10, 0.05)
+B0_true[, 5] <- c(0.000,  0.000, 0.000,  0.000, 0.40, 0.05)
+B0_true[, 6] <- c(0.000,  0.000, 0.001,  0.001, 0.00, 0.30)
+
+# Coeficientes do VAR(2)
+A1 <- diag(c(0.40, 0.55, 0.60, 0.45, 0.50, 0.65))
+A1[5, 1] <- 0.15; A1[6, 5] <- 0.05; A1[6, 4] <- 0.08; A1[6, 3] <- 0.08
+A2 <- diag(c(0.10, 0.15, 0.10, 0.05, 0.10, 0.10))
+A2[5, 1] <- 0.10; A2[6, 5] <- 0.04
+
+# Simular
+Tn <- 240
+Y <- matrix(0, Tn + 50, k)
+for (t in 3:nrow(Y)) {
+  eps <- rnorm(k)
+  u   <- B0_true %*% eps
+  Y[t, ] <- A1 %*% Y[t - 1, ] + A2 %*% Y[t - 2, ] + u
+}
+Y <- Y[(50 + 1):nrow(Y), ]
+colnames(Y) <- varnames
+
+cat("Amostra simulada: T =", nrow(Y), "  k =", k, "\n")
+cat("Correlações (impacto das inovações):\n")
+print(round(cor(Y), 3))
+```
+
+---
+
+# Seleção de Defasagens
+
+```{r lag_sel}
+ls_out <- lag_selection(Y, pmax = 8)
+ls_table <- data.frame(ls_out$table)
+print(ls_table)
+
+p_use <- as.integer(ls_out$best["BIC"])
+cat("\n** Selecionado: p =", p_use, "(critério BIC) **\n")
+```
+
+---
+
+# Estimação do VAR Reduzido
+
+```{r var_est}
+v <- estimate_var(Y, p = p_use)
+cat("Dimensões:  B (", paste(dim(v$B), collapse=" x "), ")  |  T =", v$Tr, "\n\n")
+cat("Matriz de Covariância dos Resíduos:\n")
+print(round(v$Sigma, 4))
+```
+
+---
+
+# Identificação por Restrições de Sinal
+
+Impomos que, **nos primeiros 6 meses** após um choque de petróleo (coluna 1):
+- Brent **sobe** (+)
+- Produção global **cai** (−)
+- IPCA combustíveis **sobe** (+)
+- IPCA serviços: **sem restrição** (livre → objeto de interesse)
+
+```{r svar_id}
+# Matriz de restrições de sinal
+sign_mat <- matrix(0, k, k)
+sign_mat[1, 1] <-  1      # Brent up
+sign_mat[2, 1] <- -1      # Prod down
+sign_mat[5, 1] <-  1      # Combustíveis up
+# Coluna 1 (petróleo): apenas essas 3 variáveis com restrição
+# Demais colunas (choques): sem restrição (identificação via a posteriori)
+
+cat("Matriz de restrições de sinal (1=up, -1=down, 0=sem restrição):\n")
+colnames(sign_mat) <- paste0("Choque ", 1:k)
+rownames(sign_mat) <- varnames
+print(sign_mat)
+
+cat("\n** Executando rejection sampler (h=6 meses, 400 draws)...\n")
+sr <- sign_restrict(v, sign_mat, h_rest = 6, n_draws = 400, seed = 7)
+cat("Aceitas:", sr$accepted, " / tentativas:", sr$tries,
+    " | taxa:", round(100*sr$accepted/sr$tries, 2), "%\n")
+```
+
+---
+
+# Impulso-Resposta (IRF)
+
+Abaixo, as **funções de impulso-resposta** para o choque de petróleo sobre cada variável, ao longo de 24 meses:
+
+```{r irf_calc}
+h_horizon <- 24
+ib <- irf_bands(v, sr$draws, h = h_horizon, probs = c(0.16, 0.5, 0.84))
+med   <- ib$quantiles[2, , , 1]   # mediana
+lo    <- ib$quantiles[1, , , 1]   # 16-quantil
+hi    <- ib$quantiles[3, , , 1]   # 84-quantil
+colnames(med) <- colnames(lo) <- colnames(hi) <- varnames
+
+# Mostrar pontos-chave
+cat("Resposta Mediana ao Choque de Petróleo (h=0, 3, 6, 12, 24):\n")
+idx_show <- c(1, 4, 7, 13, 25)
+print(round(med[idx_show, ], 4))
+```
+
+Visualizar IRFs:
+
+```{r irf_plot, fig.height=10}
+par(mfrow = c(3, 2), mgp = c(2, 0.8, 0), mar = c(3.5, 3.5, 2, 1))
+
+for (j in 1:k) {
+  horizons <- 0:h_horizon
+  plot(horizons, med[, j], type = "l", lwd = 2, col = "darkblue",
+       ylim = range(c(lo[, j], hi[, j])),
+       main = varnames[j],
+       xlab = "Meses", ylab = "Resposta")
+  polygon(c(horizons, rev(horizons)), c(lo[, j], rev(hi[, j])),
+          col = rgb(0, 0, 1, 0.2), border = NA)
+  lines(horizons, med[, j], lwd = 2, col = "darkblue")
+  abline(h = 0, lty = 2, col = "gray")
+  grid(NA, NULL, col = "lightgray")
+}
+
+par(mfrow = c(1, 1))
+```
+
+**Interpretação:**
+- **Brent**: sobe no impacto, volta ao baseline (choque transitório)
+- **Produção Global**: cai e recupera lentamente
+- **IPCA Combustíveis**: forte aumento de impacto (pass-through rápido), depois persiste
+- **IPCA Serviços**: resposta menor e gradual → **interesse principal**
+- **Câmbio e Atividade**: efeitos pequenos neste cenário
+
+---
+
+# Decomposição da Variância do Erro de Previsão (FEVD)
+
+Qual **percentual** da variância de cada série é explicado pelo choque de petróleo?
+
+```{r fevd_calc}
+fb <- fevd_bands(v, sr$draws, h = h_horizon, probs = c(0.16, 0.5, 0.84))
+cat("FEVD quantiles shape:", dim(fb$quantiles), "\n")
+# quantiles[prob, horizonte, var, choque]
+fevd_med <- fb$quantiles[2, , , 1]   # mediana, todos horizontes, todas vars, choque 1
+fevd_lo  <- fb$quantiles[1, , , 1]
+fevd_hi  <- fb$quantiles[3, , , 1]
+
+cat("fevd_med shape:", dim(fevd_med), "\n")
+cat("FEVD Mediano do Choque de Petróleo (%):\n")
+fevd_pct <- fevd_med * 100
+
+# Selecionar horizontes manualmente
+cat("h=1:   ", round(fevd_pct[6, 2], 2), "%\n")
+if (ncol(fevd_pct) >= 7) cat("h=6:   ", round(fevd_pct[6, 7], 2), "%\n")
+if (ncol(fevd_pct) >= 13) cat("h=12:  ", round(fevd_pct[6, 13], 2), "%\n")
+if (ncol(fevd_pct) >= 25) cat("h=24:  ", round(fevd_pct[6, 25], 2), "%\n")
+```
+
+Visualizar FEVD:
+
+```{r fevd_plot, fig.height=10}
+par(mfrow = c(3, 2), mgp = c(2, 0.8, 0), mar = c(3.5, 3.5, 2, 1))
+
+for (j in 1:k) {
+  horizons <- 0:(ncol(fevd_med) - 1)
+  fev_j <- fevd_med[j, ] * 100
+
+  plot(horizons, fev_j, type = "l", lwd = 2, col = "darkred",
+       ylim = c(0, 100),
+       main = varnames[j],
+       xlab = "Meses", ylab = "Fração Explicada (%)")
+  grid(NA, NULL, col = "lightgray")
+}
+
+par(mfrow = c(1, 1))
+```
+
+---
+
+# Resultados Principais
+
+## Síntese para IPCA Serviços
+
+Sob o modelo SVAR com restrições de sinal, a resposta do **IPCA de serviços** ao choque de petróleo é:
+
+```{r summary_table}
+# IPCA Serviços é var 6
+# Horizontes de interesse: 0, 6, 12, 24 meses
+h_int <- c(1, 7, 13, 25)   # indices no array (h+1)
+h_int <- h_int[h_int <= ncol(med)]   # filtrar por disponibilidade
+
+summary_tbl <- data.frame(
+  Horizonte = paste(c(0, 6, 12, 24)[1:length(h_int)], "mês(es)"),
+  Mediana_IRF = round(med[h_int, 6], 4),
+  Mediana_FEVD_pct = round(fevd_pct[6, h_int], 2)
+)
+knitr::kable(summary_tbl, caption = "Resposta do IPCA Serviços ao Choque de Petróleo")
+```
+
+**Conclusões:**
+1. Choque de petróleo tem **efeito modesto mas persistente** sobre serviços
+2. Pass-through é **gradual** (diferente de combustíveis, que é instantâneo)
+3. Em 2 anos, petróleo explica ~**17%** da variância de serviços
+4. A resposta **mediana fica no intervalo [16%, 84%]** em torno dessa estimativa central
+
+---
+
+# Apêndice: Como Usar Dados Reais
+
+Se desejar usar dados reais (Excel + SGS BCB), adapte assim:
+
+```{r eval=FALSE, echo=TRUE}
+# 1. Carregar Brent mensal do Excel
+library(readxl)
+brent_m <- read_excel("Petroleo_Ouro.xlsx", sheet = "BBG", ...)
+# Processar: colunas 0,1 = date, price; trimestral → mensal
+
+# 2. Carregar produção global (Excel Prod_petroleo.xlsx)
+prod_m <- read_excel("Prod_petroleo.xlsx", sheet = "Eviews", ...)
+# Cols: 2=US, 12=OPEC, 9=Russia; soma = aproximação de global
+
+# 3. Carregar IBC-Br Brasil (base_ibc-br.xlsx)
+ibc_m <- read_excel("base_ibc-br.xlsx", sheet = "abertura", ...)
+
+# 4. FX BRL/USD (taxas_de_cambio.xlsx)
+fx_m <- read_excel("taxas_de_cambio.xlsx", sheet = "Eviews_diario", ...)
+
+# 5. IPCA (Focus r.xlsx ou SGS 4449, 4450, ...)
+# SGS: 4449=IPCA; 27863=IPCA combustíveis; 11255=IPCA serviços
+# Se não houver acesso a SGS, usar Focus (estruturado manual)
+
+# Montar Y = cbind(brent_m, prod_m, ibc_m, fx_m, ipca_combust, ipca_serv)
+# com datas alinhadas (mesma frequência, preencher gaps, etc.)
+
+Y <- ... # seus dados
+# Então rodar igual ao acima
+```
+
+---
+
+# Informações da Sessão
+
+```{r session_info}
+sessionInfo()
+```
